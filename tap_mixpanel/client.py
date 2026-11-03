@@ -178,10 +178,17 @@ class MixpanelClient(object):
 
 
     @backoff.on_exception(
+        backoff.constant,
+        MixpanelRateLimitsError,
+        interval=60,
+        max_time=3600,
+        jitter=None,
+        logger=LOGGER)
+    @backoff.on_exception(
         backoff.expo,
-        (MixpanelRateLimitsError, Server5xxError, ReadTimeoutError, ConnectionError, HTTPError),
+        (Server5xxError, ReadTimeoutError, ConnectionError, HTTPError),
         max_tries=BACKOFF_MAX_TRIES_REQUEST,
-        factor=3, 
+        factor=3,
         logger=LOGGER)
     def perform_request(self,
                         method,
