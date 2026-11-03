@@ -51,6 +51,19 @@ def write_bookmark(state, stream, value):
     singer.write_state(state)
 
 
+def parse_event_list(value):
+    """Accept a list, a JSON list string or a comma-separated string of event names."""
+    if not value:
+        return set()
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = value.split(',')
+        value = [parsed] if isinstance(parsed, str) else parsed
+    return {str(event).strip() for event in value if str(event).strip()}
+
+
 def transform_datetime(this_dttm):
     with Transformer() as transformer:
         new_dttm = transformer._transform_datetime(this_dttm)
@@ -132,7 +145,8 @@ def sync_endpoint(client, #pylint: disable=too-many-branches
                   days_interval=None,
                   attribution_window=None,
                   export_events=None,
-                  denest_properties_flag=None):
+                  denest_properties_flag=None,
+                  exclude_events=None):
 
     # Get endpoint_config fields
     url = endpoint_config.get('url')
@@ -213,8 +227,15 @@ def sync_endpoint(client, #pylint: disable=too-many-branches
             # Request dates need to be normalized to project timezone or else errors may occur
             # Errors occur when from_date is > 365 days ago
             #   and when to_date > today (in project timezone)
+            # Mixpanel's from_date and to_date are both INCLUSIVE; the next window starts on
+            #   end_window's date, so stop the day before. The last window runs up to today.
+            if end_window < now_datetime:
+                to_window = max(end_window - timedelta(days=1), start_window)
+            else:
+                to_window = end_window
             from_date = '{}'.format(start_window.astimezone(tzone))[0:10]
-            to_date = '{}'.format(end_window.astimezone(tzone))[0:10]
+            to_date = '{}'.format(to_window.astimezone(tzone))[0:10]
+
             LOGGER.info('START Sync for Stream: {}{}'.format(
                 stream_name,
                 ', Date window from: {} to {}'.format(from_date, to_date) \
@@ -293,19 +314,36 @@ def sync_endpoint(client, #pylint: disable=too-many-branches
                     # time_extracted: datetime when the data was extracted from the API
                     time_extracted = utils.now()
                     transformed_data = []
+                    # Raw export is not de-duplicated by Mixpanel; emit each primary key once
+                    #   per window (windows no longer overlap, so this is sufficient).
+                    seen_keys = set()
+                    duplicate_count = 0
+                    excluded_count = 0
                     for record in data:
                         if record and str(record) != '':
+                            if exclude_events and record.get('event') in exclude_events:
+                                excluded_count += 1
+                                continue
+
                             # transform reocord and append to transformed_data array
                             transformed_record = transform_record(record, stream_name, \
                                 project_timezone, denest_properties_flag)
-                            transformed_data.append(transformed_record)
 
                             # Check for missing keys
                             for key in id_fields:
                                 val = transformed_record.get(key)
                                 if val == '' or not val:
                                     LOGGER.error('Error: Missing Key')
-                                    raise 'Missing Key'
+                                    raise MixpanelError('Missing key {} in {} record'.format(
+                                        key, stream_name))
+
+                            record_key = tuple(transformed_record.get(key) for key in id_fields)
+                            if record_key in seen_keys:
+                                duplicate_count += 1
+                                continue
+                            seen_keys.add(record_key)
+
+                            transformed_data.append(transformed_record)
                             if len(transformed_data) == limit:
                                 # Process full batch (limit = 250) records
                                 #   and get the max_bookmark_value and record_count
@@ -350,6 +388,11 @@ def sync_endpoint(client, #pylint: disable=too-many-branches
                         date_total = date_total + record_count
                         endpoint_total = endpoint_total + record_count
                         # End if transformed_data
+
+                    LOGGER.info('Stream {}: skipped {} duplicate records (same {}) '
+                                'and {} excluded-event records in this window'.format(
+                                    stream_name, duplicate_count, id_fields, excluded_count))
+                    seen_keys = None
 
                     # Export does not provide pagination; session_id = None breaks out of loop.
                     session_id = None
@@ -546,7 +589,8 @@ def sync(client, config, catalog, state, start_date):
             days_interval=int(config.get('date_window_size', '30')),
             attribution_window=int(config.get('attribution_window', '5')),
             export_events=config.get('export_events'),
-            denest_properties_flag=config.get('denest_properties', 'true')
+            denest_properties_flag=config.get('denest_properties', 'true'),
+            exclude_events=parse_event_list(config.get('export_exclude_events'))
         )
 
         update_currently_syncing(state, None)
